@@ -1,6 +1,7 @@
 #!/usr/bin/env zsh
 
-# ./install.zsh --timezone Europe/Moscow --hostname oborona --locales en_US.UTF-8,ru_RU.UTF-8 --partition /dev/sda=efi:200M,boot:fat:200M,pv1:lvm --vg pv1 --lv 'swap:enc:-L 1G,root:enc:-l 100%FREE'
+# ./arch-starter.zsh --timezone Europe/Moscow --hostname oborona --locales en_US.UTF-8,ru_RU.UTF-8 --partition /dev/sda=efi:200M,pv1:lvm --vg pv1 --lv 'swap:enc:-L 1G -y,root:enc:-l 100%FREE -y' --bootldr efistub
+# ./arch-starter.zsh --timezone Europe/Moscow --hostname oborona --locales en_US.UTF-8,ru_RU.UTF-8 --partition /dev/sda=efi:200M,boot:xbootldr:1G,pv1:lvm --vg pv1 --lv 'swap:enc:-L 1G -y,root:enc:-l 100%FREE -y' --bootldr systemd-boot
 
 zmodload zsh/zutil
 
@@ -13,11 +14,14 @@ declare timezone
 declare -aU locales
 declare hostname
 declare initramfs=mkinitcpio
-declare bootldr=uki
-declare efi_entry="Arch Linux"
+declare bootldr=systemd-boot
+declare bootentry="Arch"
 declare luks_passphrase
-declare kernel_pkg=linux
-declare kernel_cmdline=
+declare linuxpkg=linux
+declare cmdline=
+declare cmdline_fallback=
+declare esp_path=
+declare esp_path_bs=
 
 function assoc_set() {
   local arr=$1
@@ -72,9 +76,9 @@ function partition_disks() {
 
       if [[ ${${(P)dev}[luks]} == yes ]] {
         local typecode='8309'
-      } elif [[ $dev == efi ]] {
+      } elif [[ $dev == efi || ${${(P)dev}[esp]} == yes ]] {
         local typecode='EF00'
-      } elif [[ $dev == boot && $boot[xbootldr] == yes ]] {
+      } elif [[ ${${(P)dev}[xbootldr]} == yes ]] {
         local typecode='EA00'
       } else {
         local fs=${${(P)dev}[fs]}
@@ -116,33 +120,6 @@ function partition_disks() {
       if [[ -z $device ]] {
         die "Failed to look up device ${device_ref}"
       }
-      assoc_set $dev device $device
-    }
-  }
-}
-
-function create_lvm_volumes() {
-  local vg dev
-  for vg ($vgs) {
-    local plvols="vg_${vg}_lvols"
-    for dev (${(P)plvols}) {
-      local lvolname=${${(P)dev}[lvolname]}
-      local lvargstr=${${(P)dev}[lvargstr]}
-      local lvargs=(${(Q)${(z)lvargstr}})
-      local idx=${lvargs[(I)-n|--name]}
-      if (( $idx )) {
-        local lvolname=${lvargs[$idx+1]}
-        if [[ -z $lvolname ]] {
-          die "${dev} logical volume name is not set via ${lvargs[$idx]}"
-        }
-      } else {
-        local lvolname="${dev}vol"
-        lvargs+=(-n $lvolname)
-      }
-
-      say "Creating LVM logical volume '${lvolname}' in volume group '${vg}'"
-      cmd lvcreate $vg $lvargs
-      local device="/dev/${vg}/${lvolname}"
       assoc_set $dev device $device
     }
   }
@@ -285,12 +262,41 @@ function mount_devices() {
   }
 }
 
-function make_kernel_cmdline() {
-  kernel_cmdline="root=${root[device_ref]}"
-  if (( ${+swap} )) {
-    kernel_cmdline+=" resume=${swap[device_ref]}"
+function generate_cmdline() {
+  case $kernel_path {
+    (/boot/*)
+      esp_path=${(e)kernel_path##/boot/}
+      ;;
+    (/efi/*)
+      esp_path=${(e)kernel_path##/efi/}
+      ;;
+    (*)
+      die "Unsupported kernel path '${kernel_path}'"
   }
-  kernel_cmdline+=" rw"
+  esp_path_bs="\\${esp_path//\//\\}" # Replace '/' with '\\'
+  esp_path="/${esp_path}"
+
+  cmdline="root=${root[device_ref]} rw"
+  if (( ${+swap} )) {
+    cmdline+=" resume=${swap[device_ref]}"
+  }
+  cmdline_fallback=$cmdline
+  cmdline+=" quiet"
+  if [[ $bootldr == (efistub|systemd-boot:linux) ]] {
+    cmdline+=" initrd=${esp_path_bs}\\initramfs-${linuxpkg}.img"
+    cmdline_fallback+=" initrd=${esp_path_bs}\\initramfs-${linuxpkg}-fallback.img"
+  }
+  if [[ $bootldr == (uki|systemd-boot) ]] {
+    say "Generating ${mnt_root}/etc/kernel/cmdline"
+    echo -E $cmdline > ${mnt_root}/etc/kernel/cmdline
+    local exitcode=$?
+    (( $exitcode )) && die "Failed to write the file: exit code $exitcode"
+
+    say "Generating ${mnt_root}/etc/kernel/cmdline-fallback"
+    echo -E $cmdline_fallback > ${mnt_root}/etc/kernel/cmdline-fallback
+    local exitcode=$?
+    (( $exitcode )) && die "Failed to write the file: exit code $exitcode"
+  }
 }
 
 function bootstrap() {
@@ -299,7 +305,7 @@ function bootstrap() {
 
   disable_initramfs_hooks
 
-  local -a packages=($kernel_pkg linux-firmware $initramfs)
+  local -a packages=($linuxpkg linux-firmware $initramfs)
   if [[ $lvm_enabled == yes ]] {
     packages+=lvm2
   }
@@ -342,7 +348,9 @@ function bootstrap() {
   echo $hostname > ${mnt_root}/etc/hostname
   (( $? )) && die "Failed to write ${mnt_root}/etc/hostname: exit code $?"
 
-  setup_initramfs
+  say "Reading ${mnt_root}/etc/machine-id"
+  machineid=$(cat ${mnt_root}/etc/machine-id)
+  (( $? )) && die "Failed to read ${mnt_root}/etc/machine-id: exit code $?"
 }
 
 function disable_initramfs_hooks() {
@@ -358,31 +366,38 @@ function disable_initramfs_hooks() {
 }
 
 function setup_initramfs() {
-  if (( ${+efi} )) {
-    local efi_path="${efi[mnt]}/EFI/${efi_entry}"
-    mkdir -p "${mnt_root}${efi_path}"
-  } else {
-    local efi_path=${boot[mnt]}
-  }
-
   case $initramfs {
     (mkinitcpio)
-      local preset=${mnt_root}/etc/mkinitcpio.d/${kernel_pkg}.preset
+      local preset=${mnt_root}/etc/mkinitcpio.d/${linuxpkg}.preset
       say "Generating ${preset}"
-      cmd cp ${mnt_root}/usr/share/mkinitcpio/hook.preset $preset
-      cmd sed -i "s|%PKGBASE%|${kernel_pkg}|g" $preset
-      cmd sed -i 's|^#default_options=\(.\+\)$|default_options=\1|' $preset
-      if [[ $bootldr == (uki|systemd-boot) ]] {
-        cmd sed -i "s|^#\\(.\\+\\)_uki=\"\\(/[^/]\\+\\)\+/\\([^/]\+\\)\"|\\1_uki=\"${efi_path}/\\3\"|g" $preset
+      echo "# mkinitcpio preset file for the '${linuxpkg}' package\n" > $preset
+      echo "ALL_kver=\"${(e)kernel_path}/vmlinuz-${linuxpkg}\"" >> $preset
+      echo "\nPRESETS=('default' 'fallback')\n" >> $preset
+
+      case $bootldr {
+        (uki|systemd-boot)
+          echo "default_options=\"--cmdline /etc/kernel/cmdline --splash /usr/share/systemd/bootctl/splash-arch.bmp\"\n" >> $preset
+          echo "default_uki=\"${(e)kernel_path}/arch-${linuxpkg}.efi\"" >> $preset
+          echo "fallback_options=\"--cmdline /etc/kernel/cmdline-fallback -S autodetect\"" >> $preset
+          echo "fallback_uki=\"${(e)kernel_path}/arch-${linuxpkg}-fallback.efi\"" >> $preset
+          ;;
+        (efistub|systemd-boot:linux)
+          echo "default_options=\"--splash /usr/share/systemd/bootctl/splash-arch.bmp\"" >> $preset
+          echo "default_image=\"${(e)kernel_path}/initramfs-${linuxpkg}.img\"" >> $preset
+          echo "fallback_options=\"-S autodetect\"" >> $preset
+          echo "fallback_image=\"${(e)kernel_path}/initramfs-${linuxpkg}-fallback.img\"" >> $preset
+          ;;
+        (*)
+          die "Unsupported boot loader '${bootldr}'"
       }
 
       say "Setting up hooks in ${mnt_root}/etc/mkinitcpio.conf"
       local -a hooks=(base systemd autodetect modconf kms keyboard sd-vconsole block)
       if [[ $lvm_enabled == yes ]] {
-        hooks=($hooks lvm2)
+        hooks+=lvm2
       }
       if [[ $encryption_enabled == yes ]] {
-        hooks=($hooks sd-encrypt)
+        hooks+=sd-encrypt
       }
       hooks=($hooks filesystems fsck)
       cmd sed -i "s/^HOOKS=(.\\+)$/HOOKS=($hooks)/" ${mnt_root}/etc/mkinitcpio.conf
@@ -397,22 +412,64 @@ function setup_initramfs() {
 }
 
 function setup_bootldr() {
+  say "Installing EFI boot loader(s)"
   case $bootldr {
     (efistub)
-      efibootmgr --create\
-                 --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
-                 --label $efi_entry\
-                 --loader /vmlinuz-${kernel_pkg}\
-                 --unicode "root=${root[device_ref]} resume=${swap[device_ref]} rw initrd=\\initramfs-linux.img"
+      cmd efibootmgr --create\
+                     --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
+                     --label "${bootentry} (fallback)"\
+                     --loader "${esp_path_bs}\\vmlinuz-${linuxpkg}"\
+                     --unicode ${cmdline_fallback}
+
+      cmd efibootmgr --create\
+                     --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
+                     --label $bootentry\
+                     --loader "${esp_path_bs}\\vmlinuz-${linuxpkg}"\
+                     --unicode ${cmdline}
       ;;
     (uki)
-      efibootmgr --create\
-                 --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
-                 --label $efi_entry\
-                 --loader /EFI/Linux/arch-${kernel_pkg}.efi\
-                 --unicode "root=${root[device_ref]} resume=${swap[device_ref]} rw initrd=\\initramfs-linux.img"
+      cmd efibootmgr --create\
+                     --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
+                     --label "${bootentry} (fallback)"\
+                     --loader "${esp_path_bs}\\arch-${linuxpkg}-fallback.efi"
+
+      cmd efibootmgr --create\
+                     --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
+                     --label $bootentry\
+                     --loader "${esp_path_bs}\\arch-${linuxpkg}.efi"
       ;;
-    (systemd-boot)
+    (systemd-boot*)
+      local entriespath=
+      local -a bootctlargs=(--esp-path ${efi[mnt]})
+      if [[ -v boot ]] {
+        bootctlargs+=(--boot-path ${boot[mnt]})
+        entriespath="${mnt_root}${boot[mnt]}/loader/entries"
+      } else {
+        entriespath="${mnt_root}${efi[mnt]}/loader/entries"
+      }
+
+      cmd_chroot bootctl install $bootctlargs
+
+      local entrypath="${entriespath}/${machineid}.conf"
+      say "Generating ${entrypath}"
+      echo "title   ${bootentry}" > $entrypath
+      if [[ $bootldr == systemd-boot:linux ]] {
+        echo "linux   ${esp_path}/vmlinuz-${linuxpkg}" >> $entrypath
+        echo "options ${cmdline}" >> $entrypath
+      } else {
+        echo "efi     ${esp_path}/arch-${linuxpkg}.efi" >> $entrypath
+      }
+
+      entrypath="${entriespath}/${machineid}-fallback.conf"
+      say "Generating ${entrypath}"
+      echo "title   ${bootentry} (fallback)" > $entrypath
+      if [[ $bootldr == systemd-boot:linux ]] {
+        echo "linux   ${esp_path}/vmlinuz-${linuxpkg}" >> $entrypath
+        echo "options ${cmdline_fallback}" >> $entrypath
+      } else {
+        echo "efi     ${esp_path}/arch-${linuxpkg}-fallback.efi" >> $entrypath
+      }
+
       ;;
     (*)
       die "Unsupported boot loader '$bootldr'"
@@ -700,17 +757,19 @@ function parseopt_scalar_enum() {
   shift
   local opt=$1
   [[ -z $opt ]] && die "Argument error in $optname: must not be empty"
-  (( ${enum[(I)$opt]} )) || die "Argument error in $optname: unsupported option '$opt'"
+  (( ${enum[(I)$opt]} )) || die "Argument error in $optname: unsupported option '$opt', must be one of: ${(j:, :)enum}"
   assign $var $opt
 }
 
 function parseopts() {
+  setopt local_options
+  setopt extendedglob
   local opts_partition\
         opts_vg\
         opts_lv\
         opt_root\
         opt_efi\
-        opt_efi_entry\
+        opt_bootentry\
         opt_boot\
         opt_swap\
         opt_home\
@@ -727,13 +786,13 @@ function parseopts() {
              {-vg,-vgcreate}+:=opts_vg\
              {-lv,-lvcreate}+:=opts_lv\
              -efi:=opt_efi\
-             -efi-entry:=opt_efi_entry\
              -boot:=opt_boot\
              -swap:=opt_swap\
              {h,-home}:=opt_home\
              -mnt-root:=opt_mnt_root\
              {-initramfs}:=opt_initramfs\
              {-boot-loader,-bootldr}:=opt_bootldr\
+             {-boot-entry,-bootentry}:=opt_bootentry\
              -hostname:=opt_hostname\
              -timezone:=opt_timezone\
              -locales+:=opts_locales\
@@ -758,11 +817,15 @@ function parseopts() {
   (( $#locales )) || locales=(en_US.UTF-8)
   mnt_root=${${opt_mnt_root[2]:-/mnt/root}%%/}
 
-  parseopt_scalar_enum --boot-loader bootldr "efistub uki systemd-boot" ${(@)opt_bootldr}
+  parseopt_scalar_enum --boot-loader bootldr "efistub uki systemd-boot systemd-boot:linux" ${(@)opt_bootldr}
   parseopt_scalar_enum --initramfs initramfs "mkinitcpio dracut booster" ${(@)opt_initramfs}
-  parseopt_scalar --efi-entry efi_entry ${(@)opt_efi_entry}
+  parseopt_scalar --boot-entry bootentry ${(@)opt_bootentry}
+  echo kek $opt_boot
+
   parseopt_scalar --timezone timezone ${(@)opt_timezone}
   parseopt_scalar --hostname hostname ${(@)opt_hostname}
+
+  [[ $initramfs != mkinitcpio ]] && die "TODO: only --initramfs=mkinitcpio supported at the moment"
 
   local dev
   for dev ($devs) {
@@ -774,10 +837,29 @@ function parseopts() {
     }
   }
 
-  [[ -v root ]] || die "You must specify root device either as a partition, logical volume or --root option"
-  [[ -v efi || -n ${boot[esp]} ]] || die "You must specify either efi or boot partition with :esp option"
-  [[ ${boot[xbootldr]} == yes && $bootldr != systemd-boot ]] && warn "xbootldr partition is useful only with systemd-boot boot loader"
-  [[ -v efi && -v boot && $bootldr == efistub ]]
+  [[ -v root ]] || die "You must specify root device either as a partition, as a logical volume or with --root option"
+
+  if [[ -v efi ]] {
+    declare -g kernel_path='/efi/EFI/${bootentry}-${machineid}'
+  }
+  case $bootldr {
+    (^systemd-boot*)
+      [[ ${boot[xbootldr]} == yes ]] && die "xbootldr /boot partition can only be used with systemd-boot loader"
+      ;|
+    (systemd-boot*)
+      [[ -v efi ]] || die "You must specify /efi either as a partition or with --efi option"
+      if [[ -v boot ]] {
+        [[ ${boot[xbootldr]} == yes ]] || die "/boot partition must be xbootldr when systemd-boot loader is used"
+        kernel_path='/boot/${machineid}'
+      }
+      ;;
+    (efistub|uki)
+      [[ -v efi && -v boot ]] && die "With both /efi and /boot partitions defined it's ambiguous where to put kernel files"
+      if [[ -v boot ]] {
+        kernel_path='/boot'
+      }
+      ;;
+  }
 }
 
 function main() {
@@ -785,13 +867,15 @@ function main() {
   ask_luks_passphrase
   format_devices
   mount_devices
-  make_kernel_cmdline
   bootstrap
-  # setup_bootldr
+  generate_cmdline
+  setup_initramfs
+  setup_bootldr
 }
 
 function cleanup() {
-  efibootmgr -B -L $efi_entry --unicode
+  efibootmgr -B -L "${bootentry}" --unicode
+  efibootmgr -B -L "${bootentry} (fallback)" --unicode
   umount -R /mnt/root
   swapoff --all
 
@@ -805,19 +889,23 @@ function cleanup() {
 }
 
 function say() {
-  echo " [*] $1" >&2
+  echo -E " [*] $1" >&2
+}
+
+function warn() {
+  echo -E "WARN: $1" >&2
 }
 
 function cmd_chroot() {
   local -a args=(arch-chroot $mnt_root "${@[@]}")
-  echo ">>" "$args" >&2
+  echo -E ">>" "$args" >&2
   command ${args[@]}
   local exitcode=$?
   (( $exitcode )) && die "$1 exited with code $exitcode"
 }
 
 function cmd() {
-  echo ">>" "$@" >&2
+  echo -E ">>" "$@" >&2
   command "$@"
   local exitcode=$?
   (( $exitcode )) && die "$1 exited with code $exitcode"
