@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 
 # ./arch-starter.zsh --timezone Europe/Moscow --hostname oborona --locales en_US.UTF-8,ru_RU.UTF-8 --partition /dev/sda=efi:200M,pv1:lvm --vg pv1 --lv 'swap:enc:-L 1G -y,root:enc:-l 100%FREE -y' --bootldr efistub
-# ./arch-starter.zsh --timezone Europe/Moscow --hostname oborona --locales en_US.UTF-8,ru_RU.UTF-8 --partition /dev/sda=efi:200M,boot:xbootldr:1G,pv1:lvm --vg pv1 --lv 'swap:enc:-L 1G -y,root:enc:-l 100%FREE -y' --bootldr systemd-boot
+# ./arch-starter.zsh --timezone Europe/Moscow --hostname oborona --locales en_US.UTF-8,ru_RU.UTF-8 --partition /dev/sda=efi:200M,boot:xbootldr:1G,pv1:lvm --vg pv1 --lv 'swap:enc:-L 1G -y,root:enc:-l 100%FREE -y' --bootldr systemd-boot --secureboot
 
 zmodload zsh/zutil
 
@@ -10,6 +10,7 @@ declare -A partitions
 declare -aU devs vgs
 declare lvm_enabled=
 declare encryption_enabled=
+declare secureboot_enabled=
 declare timezone
 declare -aU locales
 declare hostname
@@ -20,8 +21,9 @@ declare luks_passphrase
 declare linuxpkg=linux
 declare cmdline=
 declare cmdline_fallback=
-declare esp_path=
-declare esp_path_bs=
+declare kernel_path=
+declare kernel_relpath=
+declare kernel_relpath_bs=
 
 function assoc_set() {
   local arr=$1
@@ -265,16 +267,15 @@ function mount_devices() {
 function generate_cmdline() {
   case $kernel_path {
     (/boot/*)
-      esp_path=${(e)kernel_path##/boot/}
+      kernel_relpath="/${(e)kernel_path##/boot/}"
       ;;
     (/efi/*)
-      esp_path=${(e)kernel_path##/efi/}
+      kernel_relpath="/${(e)kernel_path##/efi/}"
       ;;
     (*)
       die "Unsupported kernel path '${kernel_path}'"
   }
-  esp_path_bs="\\${esp_path//\//\\}" # Replace '/' with '\\'
-  esp_path="/${esp_path}"
+  kernel_relpath_bs=${kernel_relpath//\//\\} # Replace '/' with '\\'
 
   cmdline="root=${root[device_ref]} rw"
   if (( ${+swap} )) {
@@ -283,8 +284,8 @@ function generate_cmdline() {
   cmdline_fallback=$cmdline
   cmdline+=" quiet"
   if [[ $bootldr == (efistub|systemd-boot:linux) ]] {
-    cmdline+=" initrd=${esp_path_bs}\\initramfs-${linuxpkg}.img"
-    cmdline_fallback+=" initrd=${esp_path_bs}\\initramfs-${linuxpkg}-fallback.img"
+    cmdline+=" initrd=${kernel_relpath_bs}\\initramfs-${linuxpkg}.img"
+    cmdline_fallback+=" initrd=${kernel_relpath_bs}\\initramfs-${linuxpkg}-fallback.img"
   }
   if [[ $bootldr == (uki|systemd-boot) ]] {
     say "Generating ${mnt_root}/etc/kernel/cmdline"
@@ -306,9 +307,8 @@ function bootstrap() {
   disable_initramfs_hooks
 
   local -a packages=($linuxpkg linux-firmware $initramfs)
-  if [[ $lvm_enabled == yes ]] {
-    packages+=lvm2
-  }
+  [[ $lvm_enabled == yes ]] && packages+=lvm2
+  [[ $secureboot_enabled == yes ]] && packages+=sbctl
   cmd_chroot pacman -S --noconfirm $packages
 
   say "Setting root password at ${mnt_root}/etc/passwd"
@@ -418,25 +418,25 @@ function setup_bootldr() {
       cmd efibootmgr --create\
                      --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
                      --label "${bootentry} (fallback)"\
-                     --loader "${esp_path_bs}\\vmlinuz-${linuxpkg}"\
+                     --loader "${kernel_relpath_bs}\\vmlinuz-${linuxpkg}"\
                      --unicode ${cmdline_fallback}
 
       cmd efibootmgr --create\
                      --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
                      --label $bootentry\
-                     --loader "${esp_path_bs}\\vmlinuz-${linuxpkg}"\
+                     --loader "${kernel_relpath_bs}\\vmlinuz-${linuxpkg}"\
                      --unicode ${cmdline}
       ;;
     (uki)
       cmd efibootmgr --create\
                      --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
                      --label "${bootentry} (fallback)"\
-                     --loader "${esp_path_bs}\\arch-${linuxpkg}-fallback.efi"
+                     --loader "${kernel_relpath_bs}\\arch-${linuxpkg}-fallback.efi"
 
       cmd efibootmgr --create\
                      --disk ${efi[disk]:-$boot[disk]} --part ${efi[pt_num]:-$boot[pt_num]}\
                      --label $bootentry\
-                     --loader "${esp_path_bs}\\arch-${linuxpkg}.efi"
+                     --loader "${kernel_relpath_bs}\\arch-${linuxpkg}.efi"
       ;;
     (systemd-boot*)
       local entriespath=
@@ -454,20 +454,20 @@ function setup_bootldr() {
       say "Generating ${entrypath}"
       echo "title   ${bootentry}" > $entrypath
       if [[ $bootldr == systemd-boot:linux ]] {
-        echo "linux   ${esp_path}/vmlinuz-${linuxpkg}" >> $entrypath
+        echo "linux   ${kernel_relpath}/vmlinuz-${linuxpkg}" >> $entrypath
         echo "options ${cmdline}" >> $entrypath
       } else {
-        echo "efi     ${esp_path}/arch-${linuxpkg}.efi" >> $entrypath
+        echo "efi     ${kernel_relpath}/arch-${linuxpkg}.efi" >> $entrypath
       }
 
       entrypath="${entriespath}/${machineid}-fallback.conf"
       say "Generating ${entrypath}"
       echo "title   ${bootentry} (fallback)" > $entrypath
       if [[ $bootldr == systemd-boot:linux ]] {
-        echo "linux   ${esp_path}/vmlinuz-${linuxpkg}" >> $entrypath
+        echo "linux   ${kernel_relpath}/vmlinuz-${linuxpkg}" >> $entrypath
         echo "options ${cmdline_fallback}" >> $entrypath
       } else {
-        echo "efi     ${esp_path}/arch-${linuxpkg}-fallback.efi" >> $entrypath
+        echo "efi     ${kernel_relpath}/arch-${linuxpkg}-fallback.efi" >> $entrypath
       }
 
       ;;
@@ -475,6 +475,22 @@ function setup_bootldr() {
       die "Unsupported boot loader '$bootldr'"
       ;;
   }
+  if [[ $secureboot_enabled == yes ]] {
+    [[ -v efi ]] && ESP_PATH=${efi[mnt]} arch-chroot /mnt/root sbctl verify
+    [[ -v boot && ${boot[xbootldr]} == yes ]] && ESP_PATH=${boot[mnt]} arch-chroot /mnt/root sbctl verify
+  }
+}
+
+function setup_secureboot() {
+  [[ $secureboot_enabled == yes ]] || return
+
+  say "Setting up SecureBoot"
+  cmd_chroot sbctl create-keys
+  cmd_chroot sbctl enroll-keys --microsoft
+  cmd_chroot sbctl sign -s "${(e)kernel_path}/arch-${linuxpkg}.efi"
+  cmd_chroot sbctl sign -s "${(e)kernel_path}/arch-${linuxpkg}-fallback.efi"
+  cmd_chroot sbctl sign -s "${(e)kernel_path}/vmlinuz-${linuxpkg}"
+  [[ $bootldr == systemd-boot ]] && cmd_chroot sbctl sign -s /usr/lib/systemd/boot/efi/systemd-bootx64.efi -o /usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed
 }
 
 function generate_crypttab() {
@@ -778,7 +794,8 @@ function parseopts() {
         opt_bootldr\
         opt_hostname\
         opt_timezone\
-        opts_locales
+        opts_locales\
+        opt_secureboot
 
   zparseopts -D -E -K -\
              {r,-root}:=opt_root\
@@ -796,6 +813,7 @@ function parseopts() {
              -hostname:=opt_hostname\
              -timezone:=opt_timezone\
              -locales+:=opts_locales\
+             -secureboot=opt_secureboot\
     || exit 1
   if [[ $# != 0 ]] {
     die "unknown argument: $1"
@@ -820,10 +838,14 @@ function parseopts() {
   parseopt_scalar_enum --boot-loader bootldr "efistub uki systemd-boot systemd-boot:linux" ${(@)opt_bootldr}
   parseopt_scalar_enum --initramfs initramfs "mkinitcpio dracut booster" ${(@)opt_initramfs}
   parseopt_scalar --boot-entry bootentry ${(@)opt_bootentry}
-  echo kek $opt_boot
 
   parseopt_scalar --timezone timezone ${(@)opt_timezone}
   parseopt_scalar --hostname hostname ${(@)opt_hostname}
+
+  if [[ -n $opt_secureboot ]] {
+    secureboot_enabled=yes
+    [[ $bootldr == (efistub|systemd-boot:linux) ]] && die "There's no way to sign initramfs for SecureBoot when using '${bootldr}' boot loader"
+  }
 
   [[ $initramfs != mkinitcpio ]] && die "TODO: only --initramfs=mkinitcpio supported at the moment"
 
@@ -840,16 +862,16 @@ function parseopts() {
   [[ -v root ]] || die "You must specify root device either as a partition, as a logical volume or with --root option"
 
   if [[ -v efi ]] {
-    declare -g kernel_path='/efi/EFI/${bootentry}-${machineid}'
+    kernel_path='/efi/EFI/${bootentry}-${machineid}'
   }
   case $bootldr {
     (^systemd-boot*)
-      [[ ${boot[xbootldr]} == yes ]] && die "xbootldr /boot partition can only be used with systemd-boot loader"
+      [[ ${boot[xbootldr]} == yes ]] && die "xbootldr /boot partition can only be used with 'systemd-boot' loader"
       ;|
     (systemd-boot*)
       [[ -v efi ]] || die "You must specify /efi either as a partition or with --efi option"
       if [[ -v boot ]] {
-        [[ ${boot[xbootldr]} == yes ]] || die "/boot partition must be xbootldr when systemd-boot loader is used"
+        [[ ${boot[xbootldr]} == yes ]] || die "/boot partition must be xbootldr when 'systemd-boot' loader is used"
         kernel_path='/boot/${machineid}'
       }
       ;;
@@ -870,6 +892,7 @@ function main() {
   bootstrap
   generate_cmdline
   setup_initramfs
+  setup_secureboot
   setup_bootldr
 }
 
